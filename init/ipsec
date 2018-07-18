@@ -1,0 +1,208 @@
+#!/sbin/runscript
+# SPDX-License-Identifier: LGPL-2.1-or-later
+# Copyright © 2008-2018 ANSSI. All Rights Reserved.
+# Copyright 2007-2009 SGDN/DCSSI
+# Copyright 2010-2014 SGDSN/ANSSI
+# Author: Vincent Strubel <clipos@ssi.gouv.fr>
+# Distributed under the terms of the GNU Lesser General Public License v2.1
+
+description="start the ipsec keying daemon and the networking monitor"
+
+config_extra() {
+	return 0
+}
+
+start_extra() {
+	return 0
+}
+
+depend() {
+	need reducecap networking clip_audit jail_init
+	provide kmpd netservice
+}
+
+IPSEC_CONF="/var/run/ipsec.conf"
+IPSEC_GWLIST="/var/run/ipsec_gw.list"
+IKE_VSCTL_COOKIE="/var/run/ike.cookie"
+
+import_extra_files() {
+	if [[ -f /lib/rc/net/ipsec_extra ]]; then
+		source /lib/rc/net/ipsec_extra
+	fi
+
+	source /lib/clip/import.sub
+	source /lib/clip/net.sub
+	source /lib/rc/net/common
+
+	import_root_config 
+}
+
+get_conf() {
+	config_common || return 1
+
+        import_conf_noerr "${NET_FILE}" "yes|no" "USE_NATT" || return 1
+
+	config_extra || return 1
+}
+
+output_config() {
+	local output_file="$1"
+	local gw_list="$2"
+	source /etc/ike2/ipsec.conf.skel
+}
+
+start_monitor() {
+	start-stop-daemon -S -b -p "${MONITOR_PIDFILE}" -x /sbin/netmonitor.sh -- eth0 "$1"
+}
+
+run_monitor() {
+	if [[ -f "/var/run/umts_if" ]]; then
+		start_monitor umts
+		return $?
+	fi
+
+	if [[ -f "/var/run/wlan_if" ]]; then
+		start_monitor wifi
+		return $?
+	fi
+		
+	# eth0 is wired
+	if [[ -n "${ETH0_ADDR}" ]]; then
+		start_monitor wired
+		return $?
+	else
+		return 0
+	fi
+}
+
+iked_wait_loop() {
+	local -i cnt=0
+	local ctx="${1}"
+	while true; do
+		local tskcnt="$(awk '$1 == "Tasks:" {print $2}' "/proc/virtual/${ctx}/status")"
+		[[ "${tskcnt}" != "1" ]] && break
+		sleep 0.5
+		let "cnt+=1"
+		if [[ ${cnt} -ge 10 ]]; then
+			ewarn "Timed-out waiting for charon"
+			errormsg_add "échec du lancement du démon IKE (IPsec)"
+			return 1
+		fi
+	done
+}
+
+start_iked() {
+	local ret=0
+	local mask="$(net_get_nbrdots_mask "${ETH0_MASK}")"
+	if [[ -z "${mask}" ]]; then
+		ewarn "Invalid or unsupported mask: ${ETH0_MASK}"
+		return 1
+	fi
+
+	local ctx="$(<"/etc/jails/ike/context")"
+	if [[ -z "${ctx}" ]]; then
+		ewarn "Cannot find IKE context"
+		return 1
+	fi
+
+	local cookie="$(vsctl ike cookie)"
+	VSCTL_MAGIC_COOKIE="${cookie}" vsctl -a "${ETH0_ADDR}/${mask}" ike setup 1>/dev/null || ret=1
+	ipsec start 1>/dev/null 2>/dev/null || ret=1
+
+	iked_wait_loop "${ctx}" || ret=1
+	local mask="$(umask)"
+	umask 0066
+	rm -f "${IKE_VSCTL_COOKIE}"
+	# Leave the context in setup, so that charon can be restarted on error
+	echo -n "${cookie}" > "${IKE_VSCTL_COOKIE}"
+	umask "${mask}"
+	return $ret
+}
+
+do_start() {
+	local ret=0
+	if ! get_conf ; then
+		ewarn "Configuration failed, charon will not be started"
+		touch ${NONETWORK_MARK}
+		return 0
+	fi
+	output_config "${IPSEC_CONF}" "${IPSEC_GWLIST}" || return 1
+	if [[ -f "/var/run/charon.pid" ]]; then
+		killall charon 2>/dev/null
+		killall -9 charon 2>/dev/null
+		rm -f "/var/run/charon.pid"
+	fi
+	if [[ -f "/var/run/starter.pid" ]]; then
+		killall starter 2>/dev/null
+		killall -9 starter 2>/dev/null
+		rm -f "/var/run/starter.pid"
+	fi
+	if grep -q '^conn' "${IPSEC_CONF}"; then
+		start_iked || ret=1
+	else
+		ewarn "No connection defined, strongswan will not be started"
+	fi
+
+	start_extra
+	
+	return $ret
+}
+
+start() {
+	import_extra_files
+
+	if [[ -e "${NONETWORK_MARK}" ]]; then
+		ewarn "Fail-safe mode detected, charon will not be started"
+		return 0
+	fi
+	if ! check_networking; then
+		ewarn "No network card, charon will not be started"
+		return 0
+	fi
+
+	ebegin "Starting charon"
+	do_start
+	eend $?
+	ebegin "Starting ipsec monitor"
+	run_monitor
+	eend $?
+}
+
+stop_monitor() {
+	if [[ -e "${MONITOR_PIDFILE}" ]]; then
+		start-stop-daemon -K -p "${MONITOR_PIDFILE}" -n netmonitor.sh 
+		rm -f "${MONITOR_PIDFILE}" 2>/dev/null
+	fi
+}
+
+stop() {
+	import_extra_files
+
+	if [ -f /var/run/charon.pid ]; then
+		ebegin "Stopping charon"
+		local ret=0
+		# kill `cat /var/run/iked.pid` would be cleaner, but 
+		# killall is the workaround for killing privileged daemons
+		# with CLSM ATM.
+		ipsec stop 1>/dev/null 2>/dev/null || ret=1
+		rm -f "${IPSEC_CONF}" "${IPSEC_GWLIST}"
+		if [[ -f "${IKE_VSCTL_COOKIE}" ]]; then	
+			# No need to put an actual address here
+			VSCTL_MAGIC_COOKIE="$(<"${IKE_VSCTL_COOKIE}")" \
+				vsctl -a "127.0.42.1/255.255.255.0" ike endsetup 1>/dev/null || ret=1
+			rm -f "${IKE_VSCTL_COOKIE}"
+		fi
+		vsctl ike stop 1>/dev/null 2>/dev/null && ret=0
+		eend $ret
+	fi
+	stop_monitor
+	# Reset all virtual-IP jails to local-only addresses
+	local f
+	for f in /var/run/*-virtual; do
+		[[ -f "${f}" ]] || continue
+	
+		UPDOWN_CONFIG="$(basename ${f%-virtual})" UPDOWN_ACTION="down" \
+		UPDOWN_VIRTUAL_IP="fake" \
+			ipsec-updown
+	done
+}

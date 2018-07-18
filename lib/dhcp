@@ -1,0 +1,188 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+# Copyright © 2008-2018 ANSSI. All Rights Reserved.
+# Copyright 2008-2009 SGDN/DCSSI
+# Copyright 2010-2013 SGDSN/ANSSI
+# Author: Vincent Strubel <clipos@ssi.gouv.fr>
+# Distributed under the terms of the GNU Lesser General Public License v2.1
+
+NET_MODULE_DHCP="yes"
+
+dhcp_config_extra() {
+	return 0
+}
+
+if [[ -f /lib/rc/net/dhcp_extra ]]; then
+	source /lib/rc/net/dhcp_extra
+fi
+
+dhcp_get_conf() {
+	local host_conf="/etc/admin/conf.d/netconf/hostname"
+
+	local import_wpa=""
+
+	local i
+	for i in $(seq 0 "${IF_NUMBER}"); do
+		import_wpa="${import_wpa} ETH${i}_WPA"
+	done
+
+	import_conf_noerr "${NET_FILE}" "yes|no" ${import_wpa} 2>/dev/null
+
+	# No error here...
+	[[ -z "${HOSTNAME}" ]] && import_conf_noerr "${host_conf}" \
+					"[[:alnum:]]+" HOSTNAME 2>/dev/null
+	if [[ -z "${HOSTNAME}" ]]; then
+		HOSTNAME="$(mktemp clip.XXXXXXXX)"
+	fi
+}
+
+dhcp_check_addr() {
+	# Note : we don't check for conflict with other ETHX
+	local itf="${1}"
+	local addr="${2}"
+
+	if net_addrs_intersect "${addr}" ${ALL_LOCAL_ADDRS} ${EXTRA_LOCAL_ADDRS}; then
+		ewarn "Address ${addr} on ${itf} conflicts with local addresses"
+		errormsg_add "l'adresse DHCP ${addr} est en conflit avec une adresse interne"
+		return 1;
+	fi
+
+	return 0
+}
+
+# Create and populate dhcp jail
+dhcp_setup() {
+	local itf="${1}"
+	local route_p="${2}"
+	local var="${3}"
+
+	local output="$(mktemp /tmp/dhcp.XXXXXXXX)"
+	if [[ $? -ne 0 ]]; then
+		ewarn "Failed to create temporary dhcp file for $itf"
+		return 1
+	fi
+
+	local route_arg=""
+	[[ -z "${route_p}" ]] && route_arg="-G"
+
+	if ! dhcpcd -h "${HOSTNAME}" ${route_arg} -p -L "${itf}" 2>"${output}"; then
+		ewarn "dhcpcd failed on ${itf}, client output is as follows:"
+		cat "${output}" >&2
+		rm -f "${output}"
+		errormsg_add "le client DHCP a retourné une erreur"
+		return 1
+	fi
+	rm -f "${output}"
+
+	local addr="$(ip addr show "${itf}" | awk '$1 == "inet" { print $2 }' | head -n 1)"
+	if [[ -z "${addr}" ]]; then
+		ewarn "Could not read dhcp address on ${itf}, removing it"
+		errormsg_add "impossible de lire l'adresse DHCP"
+		net_stopif "${itf}"
+		return 1
+	fi
+
+	local ip="${addr%/*}"
+	local mask="${addr##*/}"
+
+	if ! dhcp_check_addr "${itf}" "${ip}"; then
+		ewarn "Got invalid address ${addr} on ${itf}, removing it"
+		errormsg_add "adresse DHCP invalide: ${addr}"
+		net_stopif "${itf}"
+		return 1
+	fi
+
+	einfo "${itf} got dhcp address ${addr}"
+	echo "${addr}" > "/var/run/${itf}_dhcp"
+	touch "/var/run/dhcp"
+
+	# update ETHi_ADDR/ETHi_MASK for the following modules
+	[[ -n "${ip}" ]] && export "${var}_ADDR"="${ip}"
+	[[ -n "${mask}" ]] && export "${var}_MASK"="${mask}"
+
+	if [[ -n "${route_p}" ]]; then
+		local gw="$(ip route show default | awk '$1 == "default" { print $3 }')"
+		if [[ -n "${gw}" ]]; then
+			einfo "got default route ${gw}"
+			echo "${gw}" > "/var/run/route_dhcp"
+			DEFAULT_ROUTE="${gw}"
+		else
+			ewarn "Failed to get a default route"
+			# Not necessarily an error..
+		fi
+	fi
+	return 0
+}
+
+dhcp_cleanup() {
+	rm -f "/var/run/"eth*_dhcp "/var/run/route_dhcp" "/var/run/dhcp"
+}
+
+dhcp_stop() {
+	[[ -f "/var/run/dhcp" ]] || return 0
+	vebegin "Stopping dhcp"
+	killall dhcpcd
+	veend $?
+	dhcp_cleanup
+	# NOTE: net_stopif should be called by networking script
+
+	local i
+	for i in $(seq 0 "${IF_NUMBER}"); do
+		if [[ -f "/var/run/eth${i}_wired_wpa.conf" ]]; then 
+			[[ -n "${NET_MODULE_WPA}" ]] \
+				|| source /lib/rc/net/wpa
+			wpa_supplicant_kill "eth${i}" \
+				|| ewarn "Failed to stop wpa_supplicant on eth${i}"
+			rm -f "/var/run/eth${i}_wired_wpa.conf"
+		fi
+	done
+}
+
+dhcp_start() {
+	dhcp_get_conf || return 1
+
+	local wlan_if=""
+	[[ -f "/var/run/wlan_if" ]] && wlan_if="$(<"/var/run/wlan_if")"
+
+	local i
+	for i in $(seq 0 "${IF_NUMBER}"); do
+		# If wpa_supplicant is needed on a wireless interface, it is
+		# already running by now
+		if [[ "eth${i}" != "${wlan_if}" ]]; then
+			local wpa="ETH${i}_WPA"
+			if [[ "${!wpa}" == "yes" ]]; then
+				[[ -n "${NET_MODULE_WPA}" ]] || source /lib/rc/net/wpa
+				wpa_supplicant_setup "eth${i}" \
+					"/etc/admin/conf.d/netconf/wpa_eth${i}" \
+					"wired" "wpa" || return 1
+			fi
+		fi
+
+		local itf="eth${i}"
+		local addr="ETH${i}_ADDR"
+		case "${!addr}" in
+			"dhcp_noroute")
+				ebegin "Running dhcpcd on ${itf} (no route)"
+				if ! dhcp_setup "${itf}" "" "ETH${i}"; then
+					ewarn "Failed to configure ${itf}"
+					eend 1
+					dhcp_cleanup
+					return 1
+				fi
+				eend 0
+				;;
+			"dhcp")
+				ebegin "Running dhcpcd on ${itf}"
+				if ! dhcp_setup "${itf}" "route" "ETH${i}"; then
+					ewarn "Failed to configure ${itf}"
+					eend 1
+					dhcp_cleanup
+					return 1
+				fi
+				eend 0
+				;;
+			*)
+				;;
+		esac
+	done
+}
+

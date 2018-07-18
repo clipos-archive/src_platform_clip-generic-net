@@ -1,0 +1,141 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+# Copyright © 2008-2018 ANSSI. All Rights Reserved.
+# Copyright 2009 SGDN/DCSSI
+# Copyright 2013 SGDSN/ANSSI
+# Author: Vincent Strubel <clipos@ssi.gouv.fr>
+# Distributed under the terms of the GNU Lesser General Public License v2.1
+
+NET_MODULE_WIRELESS="yes"
+
+if [[ -f /lib/rc/net/wifi_extra ]]; then
+	source /lib/rc/net/wifi_extra
+fi
+
+[[ -n "${NET_MODULE_WPA}" ]] || source /lib/rc/net/wpa
+
+wireless_get_conf() {
+	import_conf_noerr "${WIRELESS_FILE}" "wep|wpa" \
+				WIRELESS_ENCRYPTION 2>/dev/null
+	import_conf_noerr "${WIRELESS_FILE}" "[[:graph:] ]+" \
+				WIRELESS_ESSID 2>/dev/null
+
+	import_conf_noerr "${WIRELESS_FILE}" "Managed|Ad-Hoc" \
+				WIRELESS_MODE 2>/dev/null
+	
+	return 0
+}
+
+# Detect the first (we'll see about wireless routers some other day...)
+# wireless-capable interface, and rename it to "eth0" 
+# if it isn't called that already.
+# Return 0 on success, 1 on error.
+wireless_rename_if() {
+	local wlan_if="${1}"
+
+	if [[ -z "${wlan_if}" ]]; then
+		ewarn "No wireless interface detected, aborting configuration"
+		errormsg_add "aucune interface Wifi détectée"
+		return 1
+	fi
+
+	# Keep track of original name of the interface, and of the fact
+	# that it was used for wireless
+	echo "${wlan_if}" > /var/run/wlan_if
+	# Oh, good, the wireless interface has the good taste to be called
+	# "eth0" already.
+	[[ "${wlan_if}" == "eth0" ]] && return 0
+
+	# Rename any pre-existing 'eth0' to 'wifiunused0'. No error here, 
+	# a failed rename will be caught when renaming the wireless 
+	# interface.
+	ip link set name wifiunused0 dev eth0
+	ip link set ${wlan_if} down
+	if ! ip link set name eth0 dev "${wlan_if}" ; then
+		ewarn "Could not rename ${wlan_if} to eth0, aborting wireless configuration"
+		errormsg_add "impossible de renommer l'interface Wifi"
+		return 1
+	fi
+
+	veinfo "Wireless interface ${wlan_if} renamed to eth0"
+	return 0
+}
+
+wireless_start_if() {
+	local iface="${1}"
+	local conf="${2}"
+
+	[[ -z "${WIRELESS_ENCRYPTION}" ]] && WIRELESS_ENCRYPTION="none"
+
+	wpa_supplicant_setup "${iface}" "${conf}" "wireless" "${WIRELESS_ENCRYPTION}" || return 1
+}
+	
+wireless_cleanup() {
+	local wlan_if="$(<"/var/run/wlan_if")"
+	rm -f "/var/run/wlan_if"
+
+	if [[ "${wlan_if}" != "eth0" ]]; then
+		vebegin "Renaming eth0 to ${wlan_if}"
+		ip link set name "${wlan_if}" dev eth0
+		veend $?
+	fi
+
+	if ip link show 2>/dev/null | grep -q "wifiunused0"; then
+		vebegin "Renaming wifiunused0 to eth0"
+		ip link set name eth0 dev "wifiunused0"
+		veend $?
+	fi
+}
+
+wireless_stop() {
+	if [[ -f "/var/run/eth0_wpa.conf" ]]; then
+		wpa_supplicant_kill "eth0" \
+			|| ewarn "Failed to kill wpa_supplicant"
+		rm -f "/var/run/eth0_wpa.conf"
+	fi
+	write_lock "type: none\nlevel: 0"
+
+	ip link set eth0 down || ewarn "Failed to set eth0 down"
+
+	iwconfig eth0 essid off key off || ewarn "Failed to deconfigure eth0"
+
+	wireless_cleanup
+}
+	
+wireless_start() {
+	ebegin "Setting up wireless interface"
+	if ! wireless_get_conf; then
+		eend 1 "Errors in the wireless configuration"
+		errormsg_add "erreur dans la configuration wifi"
+		return 1
+	fi
+
+	local wlan_if
+	wlan_if="$(iwconfig 2>/dev/null | grep "802.11" \
+				| head -n 1 | awk '{print $1}')"
+
+	if [[ -z "${wlan_if}" ]]; then
+		eend 1 "No wireless interface could be found"
+		errormsg_add "aucune interface Wifi détectée"
+		return 1
+	fi
+
+ 	write_lock "type: wifi\nlevel: 1"
+
+	rm -f "/var/run/wlan_if"
+	if ! wireless_rename_if "${wlan_if}" ; then
+		wireless_cleanup
+		eend 1 "Failed to rename wireless interface ${wlan_if}"
+		errormsg_add "impossible de renommer l'interface wifi"
+		return 1
+	fi
+
+	if ! wireless_start_if "eth0" "${WIRELESS_FILE}" ; then
+		wireless_cleanup
+		eend 1 "Failed to set up wireless"
+		return 1
+	fi
+
+	eend 0
+}
+
+

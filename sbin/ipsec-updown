@@ -1,0 +1,176 @@
+#!/bin/sh
+# SPDX-License-Identifier: LGPL-2.1-or-later
+# Copyright © 2008-2018 ANSSI. All Rights Reserved.
+
+# ipsec-updown - update net config on IPsec child SA up/down
+# Copyright (C) 2012 SGDSN/ANSSI
+# Author: Vincent Strubel <clipos@ssi.gouv.fr>
+# Distributed under the terms of the GNU Lesser General Public License v2.1
+
+export PATH="/bin:/sbin:/usr/bin:/usr/sbin"
+
+source "/lib/clip/import.sub"
+source "/etc/conf.d/jail-net"
+
+info() {
+	logger -p daemon.info "[UPDOWN] ${1}"
+}
+
+warn() {
+	logger -p daemon.warning "[UPDOWN] ${1}"
+}
+
+error() {
+	warn "${1}"
+	exit 1
+}
+
+# Cleanup - in case of error setting UP an child SA, we call
+# ourselves again with the 'DOWN' action to reset the jail
+# to a local-only config.
+error_cleanup() {
+	if [[ "${UPDOWN_ACTION}" == "up" ]]; then
+		warn "${1}"
+		warn "Resetting jail ${JAIL} to a local-only configuration"
+		export UPDOWN_ACTION="down"
+		/sbin/ipsec-updown
+		exit 1
+	else
+		error "${1}"
+	fi
+}
+
+[[ "${UPDOWN_VIRTUAL_IP}" == "none" ]] && exit 0
+
+info "${UPDOWN_CONFIG} ${UPDOWN_ACTION}, IP ${UPDOWN_VIRTUAL_IP}"
+
+CONFIG="${UPDOWN_CONFIG##gw_}"
+JAIL=""
+LOCAL_ADDR=""
+BCAST_ADDR=""
+ALL_ADDRS=""
+
+case "${CONFIG}" in
+	admin*)
+		JAIL="admin"
+		IFNAME="admin"
+		LOCAL_ADDR="${ADMIN_LOCAL_ADDR}"
+		CHECKVAR="ADMIN_ADDR"
+		;;
+	audit*)
+		JAIL="audit"
+		IFNAME="audit"
+		LOCAL_ADDR="${AUDIT_LOCAL_ADDR}"
+		CHECKVAR="AUDIT_ADDR"
+		;;
+	rmb*)
+		JAIL="rm_b"
+		IFNAME="rmb"
+		LOCAL_ADDR="${RMB_LOCAL_ADDR}"
+		CHECKVAR="RMB_ADDR"
+		;;
+	rmh*)
+		JAIL="rm_h"
+		IFNAME="rmh"
+		LOCAL_ADDR="${RMH_LOCAL_ADDR}"
+		CHECKVAR="RMH_ADDR"
+		;;
+	update*)
+		JAIL="update"
+		IFNAME="update"
+		LOCAL_ADDR="${UPDATE_LOCAL_ADDR}"
+		CHECKVAR="UPDATE_ADDR"
+		;;
+	*)
+		error "Unsupported updown config : ${UPDOWN_CONFIG}"
+		;;
+esac
+
+[[ -d "/etc/jails/${JAIL}" ]] || error "Unknown jail: ${JAIL}"
+CTX="$(< "/etc/jails/${JAIL}/context")"
+[[ -n "${CTX}" ]] || error "No jail context for ${JAIL}"
+IF_HOST="${IFNAME}1"
+IF_GUEST="${IFNAME}0"
+
+case "${UPDOWN_ACTION}" in
+	up)
+		# Child SA UP : 
+		BCAST_ADDR="${UPDOWN_VIRTUAL_IP}"
+		ALL_ADDRS="${LOCAL_ADDR} ${BCAST_ADDR}"
+		ADDRS_OPT="-a ${LOCAL_ADDR}/255.255.255.255 -a ${BCAST_ADDR}/255.255.255.255"
+		;;
+	down)
+		BCAST_ADDR="${LOCAL_ADDR}"
+		ALL_ADDRS="${LOCAL_ADDR}"
+		ADDRS_OPT="-a ${LOCAL_ADDR}/255.255.255.255"
+		;;
+	*)
+		error "Unsupported updown action : ${UPDOWN_ACTION}"
+		;;
+esac
+
+# Check that this jail is indeed configured to use Virtual IP
+if [[ "${UPDOWN_ACTION}" == "up" ]]; then
+	# When going up, we check against the current config ...
+	import_conf_noerr "/etc/admin/conf.d/net" \
+		"${_IMPORT_FILTER_ADDR}|virtual" "${CHECKVAR}" 2>/dev/null
+	CONF_ADDR="${!CHECKVAR}"
+	if [[ "${CONF_ADDR}" != virtual ]]; then	
+		error "Jail ${JAIL} is not configured to use virtual IP"
+	fi
+	# ... then create a file in /var/run to mark this config as using
+	# a virtual IP
+	touch "/var/run/${UPDOWN_CONFIG}-virtual"
+else 
+	# When going down, we only check the file in /var/run, since the 
+	# configuration may have changed between up and down
+	[[ -f "/var/run/${UPDOWN_CONFIG}-virtual" ]] \
+		|| error "Config ${UPDOWN_CONFIG} was not brought up with a virtual IP"
+	rm -f "/var/run/${UPDOWN_CONFIG}-virtual"
+fi
+
+# Cleanup
+ip route show | grep "${IF_HOST}" | while read route; do
+	ip route del ${route} || error "Failed to delete route ${route}"
+done
+
+vspace -n "${CTX}" /sbin/ip addr show "${IF_GUEST}" \
+		| grep inet | awk '{print $2}' | while read addr; do
+	vspace -n "${CTX}" /sbin/ip addr del dev "${IF_GUEST}" "${addr}" \
+		|| error "Failed to delete address ${addr} in guest"
+done
+
+# Change the addresses in the context
+vsaddr -n "${CTX}" -r -s -l "${LOCAL_ADDR}" -b "${BCAST_ADDR}" ${ADDRS_OPT} \
+	|| error_cleanup "Failed to change network context addresses"
+
+# Update routing in host
+for addr in ${ALL_ADDRS}; do
+	ip route add "${addr}" dev "${IF_HOST}" \
+		|| error_cleanup "Failed to add route to ${addr}"
+done
+
+# Update addresses in the namespace
+for addr in ${ALL_ADDRS}; do
+	vspace -n "${CTX}" /sbin/ip addr add dev "${IF_GUEST}" "${addr}" \
+		|| error_cleanup "Failed to add address ${addr} in guest"
+done
+
+# Re-add route in the namespace
+if ! vspace -n "${CTX}" /sbin/ip route show | grep -q "${IF_GUEST}"; then
+	vspace -n "${CTX}" /sbin/ip route add dev "${IF_GUEST}" \
+		|| error_cleanup "Failed to re-add default route in guest"
+fi
+
+# Restart any needed services 
+case "${CONFIG}" in 
+	admin*)
+		vsctl admin enter -- /bin/killall -HUP sshd \
+			|| error_cleanup "Failed to restart sshd in admin"
+		;;
+	audit*)
+		vsctl audit enter -- /bin/killall -HUP sshd \
+			|| error_cleanup "Failed to restart sshd in audit"
+		;;
+esac
+info "Updated net config for jail ${JAIL}"

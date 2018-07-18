@@ -1,0 +1,217 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+# Copyright © 2008-2018 ANSSI. All Rights Reserved.
+# Copyright 2009-2013 SGDSN/ANSSI
+# Author: Vincent Strubel <clipos@ssi.gouv.fr>
+# Author: Florent Chabaud <clipos@ssi.gouv.fr>
+# Distributed under the terms of the GNU Lesser General Public License v2.1
+
+NET_MODULE_UMTS="yes"
+
+umts_start_extra() {
+	return 0
+}
+
+if [[ -f /lib/rc/net/umts_extra ]]; then
+	source /lib/rc/net/umts_extra
+fi
+
+UMTS_CONF="/var/run/umts.conf"
+UMTS_PROG=umts_config
+
+# bool umts_associate(char *interface)
+# Returns 0 if umts associates and authenticates to an APN
+# otherwise, 1
+umts_associate() { 
+	local iface="${1}" 
+	local conf="${2}" 
+	local cmd="${3}" 
+	local timeout=2
+
+	local type=$(basename $(readlink "/sys/class/net/${iface}/device/driver"))
+
+	local i=0 j=0
+	while true ; do
+		(( j=i%6 ))
+		write_lock "type: umts\nlevel: ${j}"
+		# Note: writes address to /var/run/${iface}_umts on success
+		${UMTS_PROG} "${conf}" "${type}" "${iface}" "${cmd}"
+		local ret=$?
+		case $ret in
+			0)
+				return 0
+				;;
+			249)
+				write_lock "type: umts\nlevel: 0"
+				ewarn "Unsupported device - will not retry"
+				errormsg_add "Péripherique 3G non supporté"
+				return 1
+				;;
+			250)
+				write_lock "type: umts\nlevel: 0"
+				ewarn "Invalid SIM PIN - will not retry"
+				errormsg_add "code PIN de la carte 3G incorrect"
+				return 1
+				;;
+			251)
+				write_lock "type: umts\nlevel: 0"
+				ewarn "Call failed - will not retry"
+				errormsg_add "échec de l'appel 3G - vérifiez les paramètres 'Point d'accès', 'Identifiant' et 'Mot de passe' de la connexion"
+				return 1
+				;;
+		esac
+			
+		sleep 1
+		(( i++ ))
+		[[ ${i} == ${timeout} || ${i} -gt ${timeout} ]] && break
+	done
+
+	write_lock "type: umts\nlevel: 0"
+	ewarn "UMTS assocation timed out"
+	errormsg_add "échec des tentatives de connexion UMTS"
+	return 1
+}
+
+# Detect the umts-capable interface, and rename it to "eth0" 
+# if it isn't called that already.
+# Return 0 on success, 1 on error.
+umts_rename_if() { 
+	local umts_if=""
+
+	umts_if="$(grep -l DEVTYPE=wwan /sys/class/net/*/uevent | awk -F / '{ print $5 }')"
+	# Oh, good, the umts interface has the good taste to be called
+	# "eth0" already.
+	[[ "${umts_if}" == "eth0" ]] && return 0
+
+	if [[ -z "${umts_if}" ]]; then
+		ewarn "No umts interface detected... aborting configuration"
+		errormsg_add "aucune carte UMTS détectée"
+		write_lock "type: umts\nlevel: 0"
+		return 1
+	fi
+
+	# Keep track of original name of the interface, and of the fact
+	# that it was used for umts
+	echo "${umts_if}" > "/var/run/umts_if"
+	# Rename any pre-existing 'eth0' to 'umtsunused0'. No error here, 
+	# a failed rename will be caught when renaming the umts
+	# interface.
+	ip link set name umtsunused0 dev eth0
+	ip link set ${umts_if} down
+	if ! ip link set name eth0 dev "${umts_if}" ; then
+		ewarn "Could not rename ${umts_if} to eth0, aborting umts configuration"
+		errormsg_add "impossible de renommer la carte UMTS"
+		write_lock "type: umts\nlevel: 0"
+		return 1
+	fi
+
+	veinfo "Umts interface ${umts_if} renamed to eth0"
+	return 0
+}
+
+umts_setup() { 
+	local iface="${1}"
+	local conf="${2}"
+	local ret=0
+
+	umtsconfgen.pl "${conf}" "${UMTS_CONF}" || return 1
+	umts_associate "${iface}" "${UMTS_CONF}" "up" || return 1
+}
+
+umts_start_if() { 
+	local iface="${1}"
+	local conf="${2}"
+	local var="${3}"
+	
+	umts_setup "${iface}" "${conf}" || return 1	
+
+	local addr="$(<"/var/run/${iface}_umts")"
+	local gw="$(<"/var/run/route_umts")"
+
+	local ip="${addr%/*}"
+	local mask="${addr##*/}"
+	#
+	# update ETHi_ADDR/ETHi_MASK for the following modules
+	[[ -n "${ip}" ]] && export "${var}_ADDR"="${ip}"
+	[[ -n "${mask}" ]] && export "${var}_MASK"="${mask}"
+	[[ -n "${gw}" ]] && DEFAULT_ROUTE="${gw}"
+	return 0
+}
+	
+umts_cleanup() {
+	local umts_if="$(<"/var/run/umts_if")"
+	rm -f "/var/run/umts_if"
+
+	if [[ "${umts_if}" != "eth0" ]]; then
+		ebegin "Renaming eth0 to ${umts_if}"
+		ip link set name "${umts_if}" dev eth0
+		eend $?
+	fi
+
+	if ip link show 2>/dev/null | grep -q "umtsunused0"; then
+		ebegin "Renaming umtsunused0 to eth0"
+		ip link set name eth0 dev "umtsunused0"
+		eend $?
+	fi
+
+	rm -f "/var/run/"*_umts
+	rm -f "/var/run/umts.conf"
+}
+
+umts_stop() { 
+	killall ${UMTS_PROG} 2>/dev/null \
+		|| killall -9 ${UMTS_PROG} 2>/dev/null
+
+	umts_associate "eth0" "${UMTS_CONF}" "down" || ewarn "Failed to stop umts"
+	write_lock "type: none\nlevel: 0"
+
+	umts_cleanup
+}
+
+umts_test_interface() {
+	# Needed when reactivating a UMTS config when resuming from suspend 
+	# to RAM 
+	#  - in that case, the umts interface can take a few seconds to 
+	#  reappear.
+	# Might also be useful if a user activates the config right after 
+	# plugging in the 3G token.
+	local i
+	for i in {1..5}; do
+		grep -qw DEVTYPE=wwan /sys/class/net/*/uevent && return 0
+		einfo "Waiting for umts interface"
+		sleep 2
+	done
+	return 1
+}
+
+umts_start() { 
+	ebegin "Setting up UMTS interface"
+	if ! umts_test_interface; then
+		eend 1 "UMTS networking is enabled, but there is no UMTS interface"
+		errormsg_add "aucun périphérique 3G détecté"
+		return 1
+	fi
+
+	write_lock "type: umts\nlevel: 1"
+
+	if ! umts_rename_if ; then
+		umts_cleanup
+		eend 1 "Failed to rename UMTS interface"
+		errormsg_add "impossible de renommer le périphérique 3G"
+		return 1
+	fi
+
+	if ! umts_start_if "eth0" "${UMTS_FILE}" "ETH0" ; then
+		umts_cleanup
+		eend 1 "Failed to set up UMTS networking"
+		return 1
+	fi
+
+	if ! umts_start_extra "eth0" "${UMTS_FILE}" ; then
+		umts_stop
+		eend 1 "Failed to set up UMTS networking (extra config)"
+		return 1
+	fi
+	eend 0
+}
+
+

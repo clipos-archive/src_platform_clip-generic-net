@@ -1,0 +1,170 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+# Copyright © 2008-2018 ANSSI. All Rights Reserved.
+# Copyright 2009 SGDN/DCSSI
+# Copyright 2013 SGDSN/ANSSI
+# Author: Vincent Strubel <clipos@ssi.gouv.fr>
+# Distributed under the terms of the GNU Lesser General Public License v2.1
+
+NET_MODULE_WPA="yes"
+
+# Next 4 functions are a direct rip-off from Gentoo's baselayout,
+# and are Copyright Gentoo Foundation (Author: Roy Marples).
+wpa_supplicant_associated() {
+	local itf="${1}" 
+	local -a status=()
+	eval status=( $(wpa_cli -i"${itf}" status \
+		| sed -n -e 's/^\(key_mgmt\|wpa_state\|EAP state\)=\([^=]\+\).*/\U\"\2\"/p')
+	)
+
+	case "${status[0]}" in
+		"NONE")
+			[[ ${status[1]} == "ASSOCIATED" || ${status[1]} == "COMPLETED" ]]
+			;;
+		"IEEE 802.1X (no WPA)")
+			[[ ${status[2]} == "SUCCESS" ]]
+			;;
+		"WPA2/IEEE 802.1X/EAP")
+			[[ ${status[2]} == "SUCCESS" ]]
+			;;
+		*)
+			[[ ${status[1]} == "COMPLETED" ]]
+			;;
+	esac
+}
+
+wpa_supplicant_kill() {
+	local ret=0
+	local iface="${1}" pidfile
+
+	write_lock "type: wifi\nlevel: 0\n"
+	# Now shutdown wpa_supplicant
+	pidfile="/var/run/wpa_supplicant-${iface}.pid"
+	if [[ -f ${pidfile} ]] ; then
+		einfo "Stopping wpa_supplicant on ${iface}"
+		/sbin/start-stop-daemon --stop --exec /usr/sbin/wpa_supplicant \
+			--pidfile "${pidfile}" 
+		[[ $? -eq 0 ]] || ret=1
+	fi
+	rm -f "${pidfile}"
+
+	# If wpa_supplicant exits uncleanly, we need to remove the stale dir
+	if [[ -S "/var/run/wpa_supplicant/${iface}" ]]; then
+		rm -f "/var/run/wpa_supplicant/${iface}" || ret=1
+	fi
+	return $ret
+}
+
+wpa_supplicant_killall() {
+	local ret=0 p
+	write_lock "type: wifi\nlevel: 0\n"
+	for p in /var/run/wpa_supplicant-*.pid; do
+		local iface="${p##*-}"
+		iface="${iface%%.pid}"
+		[[ "${iface}" == "*" ]] && return 0
+		einfo "Stopping wpa_supplicant on ${iface} (killall)"
+		/sbin/start-stop-daemon --stop --exec /usr/sbin/wpa_supplicant \
+			--pidfile "${p}"
+		[[ $? -eq 0 ]] || ret=1
+		rm -f "${p}"
+
+		if [[ -S "/var/run/wpa_supplicant/${iface}" ]]; then
+			rm -f "/var/run/wpa_supplicant/${iface}" || ret=1
+		fi
+	done
+	return $ret
+}
+
+# bool wpa_supplicant_associate(char *interface)
+#
+# Returns 0 if wpa_supplicant associates and authenticates to an AP
+# otherwise, 1
+wpa_supplicant_associate() {
+	local iface="${1}" 
+	local timeout="60"
+
+	local i=0 j=0
+	while true ; do
+		(( j=i%5 ))
+		write_lock "type: wifi\nlevel: ${j}\n"
+		if ! wpa_cli -i"${iface}" status &>/dev/null ; then
+			ewarn "wpa_supplicant has exited unexpectedly"
+			return 1
+		fi
+		wpa_supplicant_associated "${iface}" && return 0
+		sleep 1
+		(( i++ ))
+		[[ ${i} == "${timeout}" || ${i} -gt "${timeout}" ]] && break
+	done
+
+	ewarn "wpa_supplicant timed out"
+
+	# Kill wpa_supplicant for 0.3.x
+	wpa_supplicant_kill "${iface}"
+	return 1
+}
+
+wpa_supplicant_setup() {
+	local iface="${1}"
+	local conf="${2}"
+	local wired="${3}"
+	local encr="${4}"
+	local pidfile="/var/run/wpa_supplicant-${iface}.pid"
+	local ret=0
+	local driver=wired
+
+	local wpaconf="/var/run/${iface}_wpa.conf"
+	[[ "${wired}" == "wired" ]] && wpaconf="/var/run/${iface}_wired_wpa.conf"
+
+	ebegin "Starting wpa_supplicant on ${iface}"
+
+	if ! wpaconfgen.pl "${conf}" "${wpaconf}" "${iface}" "${encr}"; then
+		eend 1 "Failed to parse wpa_supplicant configuration"
+		errormsg_add "impossible de configurer wpa_supplicant"
+		return 1
+	fi
+
+	if [[ "${wired}" != "wired" ]]; then
+		driver="nl80211,wext"
+		# Hidden essid apparently requires SSID to be set on the 
+		# iface from iwconfig...
+		if [[ -n "${WIRELESS_ESSID}" ]]; then
+			iwconfig "${iface}" essid "${WIRELESS_ESSID}"
+			if [[ $? -ne 0 ]]; then
+				eend 1 "Failed to set essid on interface ${iface}"
+				errormsg_add "impossible d'attribuer un SSID à l'interface"
+				return 1
+			fi
+		fi
+
+		ip link set dev "${iface}" up
+		if [[ $? -ne 0 ]]; then
+			eend 1 "Failed to activate wireless on interface ${iface}"
+			errormsg_add "impossible d'activer l'interface Wifi"
+			return 1
+		fi
+	fi
+
+	/sbin/start-stop-daemon --start --exec /usr/sbin/wpa_supplicant \
+		--pidfile "${pidfile}" -- -B -c "${wpaconf}" -i "${iface}" \
+		-P "${pidfile}" -D ${driver} || ret=1
+	if [[ $ret -ne 0 ]]; then
+		eend 1 "Failed to start wpa_supplicant"
+		errormsg_add "impossible de lancer wpa_supplicant"
+		return 1
+	fi
+	eend 0
+		
+	
+	ebegin "Waiting for association"
+	if wpa_supplicant_associate "${iface}"; then
+		eend 0
+	else
+		errormsg_add "échec des tentatives d'association au réseau Wifi"
+		ip link set dev "${iface}" down
+		ret=1
+		eend 1 "Timed-out trying to associate"
+	fi
+
+	return $ret
+}
+

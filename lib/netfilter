@@ -1,0 +1,509 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+# Copyright © 2008-2018 ANSSI. All Rights Reserved.
+# Copyright 2006-2009 SGDN/DCSSI
+# Copyright 2010-2015 SGDSN/ANSSI
+# Authors: Vincent Strubel <clipos@ssi.gouv.fr>
+#          Mickaël Salaün <clipos@ssi.gouv.fr>
+# Distributed under the terms of the GNU Lesser General Public License v2.1
+
+NET_MODULE_NETFILTER="yes"
+
+SINGLEPORT_IMPORT_FILTER="[0-9]{2,5}"
+MULTIPORT_IMPORT_FILTER="-|([0-9]{1,5}(:[0-9]{1,5})?(,[0-9]{1,5}(:[0-9]{1,5})?)*)"
+SAME_IMPORT_FILTER="${MULTIPORT_IMPORT_FILTER}"
+NET_IMPORT_FILTER="[0-9]{1,3}.[0-9]{1,3}.[0-9]{1,3}.[0-9]{1,3}/[0-9]{1,2}"
+
+NETFILTER_FILE="/etc/admin/conf.d/netconf/netfilter"
+SYSLOG_FILE="/etc/audit/syslog"
+
+NETFILTER_IMPORT_NOLOG="NOLOG_IN_TCP NOLOG_IN_UDP"
+
+
+NETFILTER_IMPORT_MULTIPORT="UPDATE_OUT_TCP UPDATE_OUT_UDP"
+
+NETFILTER_IMPORT_SAME="UPDATE_OUT_SAME_TCP UPDATE_OUT_SAME_UDP"
+
+netfilter_config_extra() {
+	return 0
+}
+
+netfilter_conflocal_extra() {
+	return 0
+}
+
+netfilter_local_extra() {
+	return 0
+}
+
+netfilter_init_extra() {
+	return 0
+}
+
+netfilter_start_extra() {
+	return 0
+}
+
+if [[ -f /lib/rc/net/netfilter_extra ]]; then
+	source /lib/rc/net/netfilter_extra
+fi
+
+netfilter_conflocal() {
+	config_local || return 1
+	netfilter_conflocal_extra || return 1
+}
+
+netfilter_get_conf() {
+	NETFILTER_FILTER_ISAKMP=""
+
+	local i var
+	for i in $(seq 0 ${IF_NUMBER}); do
+		ADDR_IMPORT_VARS="${ADDR_IMPORT_VARS} ETH${i}_ADDR"
+		MASK_IMPORT_VARS="${MASK_IMPORT_VARS} ETH${i}_MASK"
+		var="ETH${i}_OUT"
+		if [[ -n "${!var}" ]]; then
+			NETFILTER_IMPORT_MULTIPORT="${NETFILTER_IMPORT_MULTIPORT} 
+					ETH${i}_OUT_TCP ETH${i}_OUT_UDP"
+			NETFILTER_IMPORT_SAME="${NETFILTER_IMPORT_SAME} 
+					ETH${i}_OUT_SAME_TCP ETH${i}_OUT_SAME_UDP"
+			NETFILTER_FILTER_ISAKMP="${NETFILTER_FILTER_ISAKMP} ETH${i}_OUT_UDP ETH${i}_OUT_SAME_UDP"
+		fi
+		var="ETH${i}_IN"
+		if [[ -n "${!var}" ]]; then
+			NETFILTER_IMPORT_MULTIPORT="${NETFILTER_IMPORT_MULTIPORT} 
+					ETH${i}_IN_SAME_TCP ETH${i}_IN_SAME_UDP"
+			NETFILTER_IMPORT_SAME="${NETFILTER_IMPORT_SAME} 
+					ETH${i}_IN_TCP ETH${i}_IN_UDP"
+			NETFILTER_FILTER_ISAKMP="${NETFILTER_FILTER_ISAKMP} ETH${i}_IN_UDP ETH${i}_IN_SAME_UDP"
+		fi
+	done
+
+	import_conf_all "${NETFILTER_FILE}" "${MULTIPORT_IMPORT_FILTER}" $NETFILTER_IMPORT_MULTIPORT 2>/dev/null
+	import_conf_all "${NETFILTER_FILE}" "${SAME_IMPORT_FILTER}" $NETFILTER_IMPORT_SAME 2>/dev/null
+	import_conf_all "${NETFILTER_FILE}" "${MULTIPORT_IMPORT_FILTER}" $NETFILTER_IMPORT_NOLOG 2>/dev/null
+
+	import_conf_noerr "${NETFILTER_FILE}" "[a-z]{2,6}" "ILLEGAL_LOGLEV" \
+		|| return 1
+	import_conf_noerr "${NETFILTER_FILE}" "[0-9]{1,3}/minute" "ILLEGAL_LOGLIM" \
+		|| return 1
+	
+	# No error here
+	import_conf_noerr "${SYSLOG_FILE}" "${SINGLEPORT_IMPORT_FILTER}" "REMOTE_LOG_PORT" 2>/dev/null
+
+	netfilter_config_extra || return 1
+
+	# Remove ISAKMP ports from 'normal' pass rules, they are managed by 
+	# pass_ipsec_if() calls
+	filter_conf_all 's/4\?500,\?//g; s/,$//' ${NETFILTER_FILTER_ISAKMP}
+}
+
+# The /etc/jails/<jail_name>/netfilter file can set {RED,BLACK}_IN_TCP=<port>
+# to listen on the black or red interface. The jail must have a veth and it's
+# IP in /etc/conf.d/jail-net in the form of <JAIL_NAME>_LOCAL_ADDR=<ip>
+# according to it's name. The jail's context is used to mark outgoing packets
+# to bypass IPsec restrictions and be send in cleartext.
+setup_jail_netfilter() {
+	local jailpath="${1}"
+	local jail="${jailpath##*/}"
+	local veth="${jail//_}"
+	local ctx="$(<"${jailpath}/context")"
+
+	if [[ -z "${ctx}" ]]; then
+		ewarn "No context for jail ${jail}, skipping netfilter rules"
+		return 0
+	fi
+
+	# Black is eth0
+	local black_if="eth0"
+	# Red is eth1
+	local red_if="eth1"
+
+	local side
+	for side in "red" "black"; do
+		# setup_pass_args_* "${side^^}"
+		local port="$(awk -F'=' "\$1 == \"${side^^}_IN_TCP\" {print \$2}" "${jailpath}/netfilter")"
+		port="${port//[\"\']/}"
+		if [[ -z "${port}" ]]; then
+			continue
+		fi
+
+		ebegin "Setting up the ${side} side for jail ${jail}"
+		local side_if="${side}_if"
+		side_if="${!side_if}"
+
+		local side_nat_var="${side_if^^}_ADDR"
+		local side_nat_addr="${!side_nat_var}"
+		if [[ -z "${side_nat_addr}" ]]; then
+			eend 1 "No address for ${side_if}, skipping netfilter rules"
+			return 1
+		fi
+
+		local jail_nat_var="${jail^^}_LOCAL_ADDR"
+		local jail_nat_addr="${!jail_nat_var}"
+		if [[ -z "${jail_nat_addr}" ]]; then
+			eend 1 "No address for ${veth}0, skipping netfilter rules"
+			return 1
+		fi
+
+		dnat_if "${side_if}" "tcp" "${side_nat_addr}" "${jail_nat_addr}" "${port}" || return 1
+		snat_cleartext_forward "${veth}1" "${side_if}" "${side_nat_addr}" "0x${ctx}" || return 1
+		bypass_ipsec "${side_if}" "0x${ctx}" || return 1
+		declare -A PASS_ARGS
+		PASS_ARGS["in_tcp"]="${port}"
+		pass_compartment "${veth}1" "${side_if}" "jail${veth}clear" "forward:in" "${jail_nat_addr}" "-" || return 1
+		unset PASS_ARGS
+
+		eend 0
+		# Only expose one side
+		break
+	done
+}
+
+config_jail_netfilter() {
+	local jailpath
+	for jailpath in "/etc/jails/"*; do
+		if [[ -e "${jailpath}/netfilter" ]]; then
+			setup_jail_netfilter "${jailpath}" || return 1
+		fi
+	done
+}
+
+netfilter_init() {
+	set_default_rules || return 1
+	local var esp_addr
+	if [[ -z "${UPDATE_NOIPSEC}" ]]; then
+		if [[ -n "${UPDATE_GW}" ]]; then
+			var="ETH${UPDATE_IF}_ADDR"
+			esp_addr="${!var}"
+			force_ipsec_forward "update1" "-" "${esp_addr}" "${UPDATE_GW}" || return 1
+			pass_ipsec_if "eth${UPDATE_IF}" "${esp_addr}" "${UPDATE_GW}" || return 1
+		fi
+	fi
+
+	if [[ -z "${ADMIN_NOIPSEC}" ]]; then
+		var="ETH${USER_IF}_ADDR"
+		esp_addr="${!var}"
+		if [[ -n "${ADMIN_GW}" ]]; then
+			pass_ipsec_if "eth${USER_IF}" "${esp_addr}" "${ADMIN_GW}" || return 1
+			force_ipsec_forward "admin1" "eth${USER_IF}" "${esp_addr}" "${ADMIN_GW}" || return 1
+		fi
+		if [[ -n "${AUDIT_GW}" ]]; then
+			pass_ipsec_if "eth${USER_IF}" "${esp_addr}" "${AUDIT_GW}" || return 1
+			force_ipsec_forward "audit1" "eth${USER_IF}" "${esp_addr}" "${AUDIT_GW}" || return 1
+		fi
+	fi
+
+	# Must be called before force_ipsec_if from netfilter_init_extra
+	config_jail_netfilter
+
+	netfilter_init_extra || return 1
+}
+
+netfilter_pass_ethi() {
+	local i="${1}"
+	local var addr
+	local dir=""
+	declare -A PASS_ARGS
+
+	var="ETH${i}_ADDR"
+	addr="${!var}"
+
+	var="ETH${i}_IN"
+	if [[ -n "${!var}" ]]; then
+		setup_pass_args_in "ETH${i}"
+		dir="in"
+	fi
+	var="ETH${i}_OUT"
+	if [[ -n "${!var}" ]]; then
+		setup_pass_args_out "ETH${i}"
+		dir="${dir}out" # gives us 'out' or 'inout' :)
+	fi
+
+	if [[ -f "/var/run/eth${i}_dhcp" ]]; then
+		PASS_ARGS["out_dhcp"]="1"
+		[[ "${dir}" == "${dir/out/}" ]] && dir="${dir}out"
+	fi
+		
+
+	if [[ -n "${dir}" ]]; then
+		pass_compartment "eth${i}" "eth${i}" "eth${i}"	\
+			"${dir}" "${addr}" "-" 			\
+			|| return 1
+	fi
+	unset PASS_ARGS
+}
+
+# UPDATE jail - outgoing connections, with or without IPsec
+netfilter_update() {
+	if [[ -n "${UPDATE_NOIPSEC}" || -n "${UPDATE_GW}" ]]; then
+		declare -A PASS_ARGS
+		setup_pass_args_out "UPDATE"
+		pass_compartment "update1" "eth${UPDATE_IF}" "update" "forward:out" "-" "-"   	  \
+			|| return 1
+		unset PASS_ARGS
+	fi
+
+	if [[ -n "${UPDATE_NOIPSEC}" ]]; then
+		local snat_addr="ETH${UPDATE_IF}_ADDR"
+		snat_cleartext_forward "update1" "eth${UPDATE_IF}" "${!snat_addr}" "0x501" \
+			|| return 1
+	fi
+		
+}
+
+# ADMIN and AUDIT jails, connections to and from a regular interface (USER_IF - eth0 with ipsec
+# on clients and gateways, or eth1 without ipsec on gateways)
+# Possible connections : 
+#   - SSH in for ADMIN and AUDIT (if nonlocal addresses exist for those jails)
+#   - syslog out for AUDIT
+netfilter_admin_regular() {
+	local nat_var="ETH${USER_IF}_ADDR"
+	local nat_addr="${!nat_var}"
+
+	local do_admin=""
+	local do_audit=""
+	# Rules created :
+	#  - dnat rules when no IPsec is to be used, and static addresses are defined
+	#  - snat rule for audit when remote logging is active and no IPsec is to be used
+	#  - pass rules in FORWARD when either 
+	#  	- no IPsec is to be used and static addresses are defined (or remote logging 
+	#  	is active in the case for AUDIT)
+	#  	- IPsec is to be used, a gateway and a local address (static or virtual) is 
+	#  	defined
+	if [[ -n "${ADMIN_NOIPSEC}" ]]; then
+		if [[ -n "${ADMIN_ADDR}" && "${ADMIN_ADDR}" != "virtual" ]]; then
+			dnat_if "eth${USER_IF}" "tcp" "${nat_addr}" "${ADMIN_ADDR}" "22" \
+				|| return 1
+			do_admin="yes"
+		fi
+		if [[ -n "${AUDIT_ADDR}" && "${AUDIT_ADDR}" != "virtual" ]]; then
+			dnat_if "eth${USER_IF}" "tcp" "${nat_addr}" "${AUDIT_ADDR}" "23" \
+				|| return 1
+			do_audit="yes"
+		fi
+		
+		if [[ -n "${REMOTE_LOG_PORT}" ]]; then
+			snat_cleartext_forward "audit1" "eth${USER_IF}" "${nat_addr}" "0x503" \
+				|| return 1
+			do_audit="yes"
+		fi
+	else
+		[[ -n "${ADMIN_GW}" && -n "${ADMIN_ADDR}" ]] && do_admin="yes"
+		[[ -n "${AUDIT_GW}" && -n "${AUDIT_ADDR}" ]] && do_audit="yes"
+	fi
+
+	if [[ -n "${do_admin}" ]]; then
+		declare -A PASS_ARGS
+		PASS_ARGS["in_tcp"]="22"
+		pass_compartment "admin1" "eth${USER_IF}" "admin"	\
+					"forward:in" "-" "-" 		\
+				|| return 1
+		unset PASS_ARGS
+	fi
+	if [[ -n "${do_audit}" ]]; then
+		# We don't necessarily need a non-local address when doing only remote logging 
+		# without IPsec
+		declare -A PASS_ARGS
+		if [[ -n "${AUDIT_ADDR}" ]]; then
+			if [[ -n "${REMOTE_LOG_PORT}" ]]; then
+				PASS_ARGS["in_tcp"]="23"
+				PASS_ARGS["out_tcp"]="${REMOTE_LOG_PORT}"
+			else
+				PASS_ARGS["in_tcp"]="23"
+			fi
+		else
+			if [[ -n "${REMOTE_LOG_PORT}" ]]; then
+				PASS_ARGS["out_tcp"]="${REMOTE_LOG_PORT}"
+			fi
+		fi
+		pass_compartment "audit1" "eth${USER_IF}" "audit"	\
+					"forward:inout" "-" "-"		\
+			|| return 1
+		unset PASS_ARGS
+	fi
+}
+
+# ADMIN and AUDIT SSH in connections in cleartext on a dedicated interface
+netfilter_admin_cleartext() {
+	local nat_var="ETH${ADMIN_IF}_ADDR"
+	local nat_addr="${!nat_var}"
+
+	if [[ -n "${ADMIN_ADDR}" ]]; then
+		dnat_if "eth${ADMIN_IF}" "tcp" "${nat_addr}" "${ADMIN_ADDR}" "22" \
+				|| return 1
+		declare -A PASS_ARGS
+		PASS_ARGS["in_tcp"]="22"
+		pass_compartment "admin1" "eth${ADMIN_IF}" "admclear" 	\
+						"forward:in" "-" "-"	\
+			|| return 1
+		unset PASS_ARGS
+	fi
+
+	if [[ -n "${AUDIT_ADDR}" ]]; then
+		dnat_if "eth${ADMIN_IF}" "tcp" "${nat_addr}" "${AUDIT_ADDR}" "23" \
+					|| return 1
+
+		declare -A PASS_ARGS
+		if [[ -n "${REMOTE_LOG_PORT}" ]]; then
+			snat_cleartext_forward "audit1" "eth${ADMIN_IF}" "${nat_addr}" "0x503" \
+				|| return 1
+
+			PASS_ARGS["out_tcp"]="${REMOTE_LOG_PORT}" 
+			PASS_ARGS["in_tcp"]="23"
+		else
+			PASS_ARGS["in_tcp"]="23"
+		fi
+		pass_compartment "audit1" "eth${ADMIN_IF}" "audclear"		\
+				"forward:inout" "-" "-"				\
+			|| return 1
+		unset PASS_ARGS
+	fi
+}
+
+netfilter_nolog_bcast_eth0() {
+	[[ -z "${NOLOG_IN_UDP}" ]] && NOLOG_IN_UDP="all"
+	[[ -z "${NOLOG_IN_TCP}" ]] && NOLOG_IN_TCP="-"
+
+	local bcast="$(net_get_bcast "${ETH0_ADDR}" "${ETH0_MASK}")"
+	if [[ -z "${bcast}" ]]; then
+		ewarn "Failed to get broadcast address for eth0"
+		return 0
+	fi
+
+	if [[ "${NOLOG_IN_UDP}" != "-" ]]; then
+		drop_nolog "in" "INPUT" "eth0" "${bcast}" "udp" "${NOLOG_IN_UDP}" \
+			|| return 1
+	fi
+	
+	if [[ "${NOLOG_IN_TCP}" != "-" ]]; then
+		drop_nolog "in" "INPUT" "eth0" "${bcast}" "tcp" "${NOLOG_IN_TCP}" \
+			|| return 1
+	fi
+}
+
+pass_local_ssh() {
+	local jailpath="${1}"
+	local jail="${jailpath##*/}"
+	local veth="${jail//_}"
+
+	local port
+	port="$(awk -F'=' '$1 == "SSH_PORT" {print $2}' "${jailpath}/ssh")"
+
+	if [[ -z "${port}" ]]; then
+		ewarn "No SSH_PORT for jail ${jail}, skipping local netfilter rules"
+		return 0
+	fi
+
+	# Inbound SSH - remove any extra quotes in $port
+	pass_local_fw "user1" "${veth}1" "${port//[\"\']/}" || return 1
+	# Outbound X forwarding
+	pass_local_fw "${veth}1" "user1" "6000:6100" || return 1
+}
+
+netfilter_local() {
+	export ILLEGAL_LOGLEV=info
+	export ILLEGAL_LOGLIM="10/minute"
+	set_policy || return 1
+	flush_all || return 1
+
+	set_local_rules || return 1
+
+	local jailpath
+	for jailpath in "/etc/jails/"*; do
+		[[ -e "${jailpath}/veth" ]] || continue
+		local jail="${jailpath##*/}"
+		pass_local_unreachable "${jail//_}1" || return 1
+		if [[ -e "${jailpath}/ssh" ]]; then
+			pass_local_ssh "${jailpath}" || return 1
+		fi
+	done
+
+	netfilter_local_extra || return 1
+}
+
+netfilter_do() {
+	local phase="${1}"
+	local arg="${2}"
+
+	if ! netfilter_${phase} ${arg}; then
+		ewarn "Netfilter configuration failed at phase ${phase} ${arg}"
+		errormsg_add "erreur netfilter durant la phase ${phase} ${arg}"
+		return 1
+	fi
+}
+
+netfilter_do_start() {
+	netfilter_do local || return 1
+	netfilter_do init || return 1
+	netfilter_do update || return 1
+	netfilter_do admin_regular || return 1
+	if [[ -n "${ADMIN_IF}" ]]; then
+		netfilter_do admin_cleartext || return 1
+	fi
+	local i
+	for i in $(seq 0 ${IF_NUMBER}); do
+		netfilter_do pass_ethi ${i} || return 1
+	done
+	netfilter_do start_extra || return 1
+	# don't error out here, it's only for conveniency
+	netfilter_do nolog_bcast_eth0 
+	if ! set_final_rules; then
+		ewarn "Netfilter configuration failed while setting up final rules"
+		errormsg_add "erreur netfilter durant la finalisation des règles"
+		return 1
+	fi
+}
+
+netfilter_start() {
+	if [[ -n "${NET_NO_INTERFACE}" ]]; then
+		ebegin "No network card, loading local rules only"
+		if ! netfilter_conflocal; then
+			ewarn "Errors in the netfilter config"
+			return 1
+		fi
+		netfilter_local
+		local ret=$? 
+		eend $ret "Failed to load local rules"
+		return $ret
+	fi
+
+	if [[ -e "${NONETWORK_MARK}" ]] ;then
+		ebegin "Failsafe mode detected, loading failsafe netfilter rules"
+		if ! netfilter_conflocal; then
+			ewarn "Errors in the networking config"
+		fi
+		netfilter_local
+		local ret=$? 
+		eend $ret "Failed to load failsafe rules"
+		return $ret
+	fi
+
+	if ! netfilter_get_conf; then
+		errormsg_add "erreur dans la configuration du pare-feu"
+		ebegin "Errors in the networking config. Loading local rules only"
+		netfilter_local
+		eend $?
+		return 1
+	fi
+
+	ebegin "Loading netfilter policies"
+	if ! netfilter_do_start; then
+		unset PASS_ARGS
+		eend 1 "Failed to load netfilter policies, reloading local rules"
+		errormsg_add "erreur dans le chargement des règles de pare-feu"
+		netfilter_local
+		if [[ $? -ne 0 ]]; then
+			ewarn "Failed to load failsafe rules"
+		fi
+		return 1
+	else
+		unset PASS_ARGS
+		eend 0
+	fi
+}
+
+# N.B. : no stop() - we leave rules in place until reboot or new rules are loaded
+
+netfilter_status() {
+	import_extra_files
+	print_status
+}

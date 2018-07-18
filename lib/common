@@ -1,0 +1,233 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+# Copyright © 2008-2018 ANSSI. All Rights Reserved.
+# Copyright 2008-2009 SGDN/DCSSI
+# Copyright 2010-2013 SGDSN/ANSSI
+# Author: Vincent Strubel <clipos@ssi.gouv.fr>
+# Distributed under the terms of the GNU Lesser General Public License v2.1
+
+IMPORT_ADDRESSES_LOCAL="UPDATE_ADDR ADMIN_ADDR AUDIT_ADDR"
+IMPORT_ADDRESSES="DEFAULT_ROUTE"
+IMPORT_MASKS=""
+MONITOR_PIDFILE="/var/run/netmonitor.pid"
+
+ADDR_MULTI_FILTER="${_IMPORT_FILTER_ADDR}( ${_IMPORT_FILTER_ADDR})*"
+NET_IMPORT_FILTER="${_IMPORT_FILTER_ADDR}/${_IMPORT_FILTER_MASK}"
+NET_MULTI_FILTER="${NET_IMPORT_FILTER}( ${NET_IMPORT_FILTER})*"
+
+IMPORT_MULTI_ADDRESSES=""
+
+if [[ -z "${UPDATE_NOIPSEC}" ]]; then
+	IMPORT_MULTI_ADDRESSES="${IMPORT_MULTI_ADDRESSES} UPDATE_GW"
+fi
+if [[ -z "${ADMIN_NOIPSEC}" ]]; then
+	IMPORT_MULTI_ADDRESSES="${IMPORT_MULTI_ADDRESSES} ADMIN_GW AUDIT_GW"
+fi
+
+CONFLINK="/etc/admin/conf.d/netconf" 2>/dev/null
+CONFPATH="/etc/admin/netconf.d" 2>/dev/null
+
+NET_CONST_FILE="/etc/admin/conf.d/net"
+NET_FILE="${CONFLINK}/net"
+IPSEC_FILE="${CONFLINK}/ipsec"
+if [ ! -f "${IPSEC_FILE}" ]; then
+	IPSEC_FILE="${NET_FILE}"
+fi
+NET_STATUS="/usr/local/var/net_status"
+NET_ERROR="/usr/local/var/net_error"
+NET_CHOICE="/usr/local/var/net_choice"
+NETLOCAL_MARK="/var/run/net_local_only"
+NONETWORK_MARK="/var/run/nonetwork"
+DOWNLOAD_LOCK="/mounts/update_priv/var/run/net_no_download"
+
+source /lib/clip/import.sub
+source /lib/clip/net.sub
+source /lib/clip/misc.sub
+source /etc/conf.d/jail-net
+
+import_root_config() {
+	import_conf_noerr "${NET_CONST_FILE}" '[a-zA-Z]+' 'NET_BASE_TYPE' \
+		2>/dev/null
+
+	if [[ -n "${NET_BASE_TYPE}" ]]; then 
+		if [[ -f "/etc/conf.d/net-${NET_BASE_TYPE}" ]]; then
+			source "/etc/conf.d/net-${NET_BASE_TYPE}"
+		else
+			ewarn "/etc/conf.d/net-${NET_BASE_TYPE} not present"
+			source "/etc/conf.d/net"
+		fi
+	else
+		source "/etc/conf.d/net"
+	fi
+}
+
+check_networking() {
+	[[ -e "${NETLOCAL_MARK}" ]] && return 1
+	local if_count="$(ip link show | wc -l)"
+	# If we have only 'lo', then we get 2 lines of output
+	if [[ ${if_count} -le 2 ]]; then
+		NET_NO_INTERFACE="yes"
+		return 1 
+	fi
+	return 0
+}
+
+config_local() {
+	import_conf_all "${NET_CONST_FILE}" "${_IMPORT_FILTER_ADDR}|virtual" ${IMPORT_ADDRESSES_LOCAL} 2>/dev/null
+
+	ALL_LOCAL_ADDRS=""
+	local n
+	for n in USER UPDATE ADMIN AUDIT; do 
+		local var="${n}_ADDR"
+		local addr="${!var/virtual/}"
+		var="${n}_LOCAL_ADDR"
+		ALL_LOCAL_ADDRS="${ALL_LOCAL_ADDRS} ${addr} ${!var}"
+	done
+}
+
+config_common() {
+	if [[ "${IF_NUMBER}" -lt 1 ]]; then
+		ewarn "IF_NUMBER should be at least 1"
+		IF_NUMBER="1"
+	fi
+	let "IF_NUMBER-=1"
+
+	if [[ -z "${USER_IF}" ]]; then
+		ewarn "USER_IF not defined, taking 0 as default"
+		USER_IF=0
+	fi
+	if [[ -z "${UPDATE_IF}" ]]; then
+		ewarn "UPDATE_IF not defined, taking 0 as default"
+		UPDATE_IF=0
+	fi
+	if [[ "${USER_IF}" -gt "${IF_NUMBER}" ]]; then
+		ewarn "USER_IF is too big"
+		return 1
+	fi
+	if [[ "${UPDATE_IF}" -gt "${IF_NUMBER}" ]]; then
+		ewarn "UPDATE_IF is too big"
+		return 1
+	fi
+
+	if [[ -n "${ADMIN_IF}" ]]; then
+		if [[ "${ADMIN_IF}" -gt "${IF_NUMBER}" ]]; then
+			ewarn "ADMIN_IF is too big"
+			return 1
+		fi
+
+		if [[ ! -e "/sys/class/net/eth${ADMIN_IF}" ]] ; then
+			einfo "eth${ADMIN_IF} not present, disabling ADMIN_IF"
+			export ADMIN_IF=""
+		fi
+	fi
+
+
+	config_local || return 1
+
+	ALL_EXTERNAL_ADDRS=""
+
+	local i
+	for i in $(seq 0 ${IF_NUMBER}); do
+		# Note: this is not matched for autonet - we import ETHi_ADDR="dhcp" in 
+		# that case
+		if [[ -f "/var/run/eth${i}_umts" ]]; then
+			local addr="$(<"/var/run/eth${i}_umts")"
+			export ETH${i}_ADDR="${addr%%/*}"
+			local mask="${addr##*/}"
+			if [[ "${mask}" == "${addr}" ]] ; then 
+				export ETH${i}_MASK="32"
+			else
+				export ETH${i}_MASK="${addr##*/}"
+			fi
+		elif [[ -f "/var/run/eth${i}_dhcp" ]]; then
+			local addr="$(<"/var/run/eth${i}_dhcp")"
+			export ETH${i}_ADDR="${addr%%/*}"
+			export ETH${i}_MASK="${addr##*/}"
+		else
+			IMPORT_ADDRESSES="${IMPORT_ADDRESSES} ETH${i}_ADDR"
+		fi
+	done
+
+	import_conf_noerr "${NET_FILE}" "${_IMPORT_FILTER_ADDR}|umts|dhcp|dhcp_noroute" \
+		${IMPORT_ADDRESSES} 2>/dev/null \
+		|| return 1
+
+	for i in $(seq 0 ${IF_NUMBER}); do
+		local var="ETH${i}_ADDR"
+		ALL_EXTERNAL_ADDRS="${ALL_EXTERNAL_ADDRS} ${!var}"
+	done
+
+	if [[ -n "${IMPORT_MULTI_ADDRESSES}" ]]; then
+		import_conf_all "${IPSEC_FILE}" "${ADDR_MULTI_FILTER}" \
+			${IMPORT_MULTI_ADDRESSES} 2>/dev/null
+		import_conf_all "${IPSEC_FILE}" "rr|linear" \
+			${IMPORT_MULTI_ADDRESSES//_GW/_REDUNDANCY} 2>/dev/null
+		import_conf_noerr "${IPSEC_FILE}" "yes|no" \
+			${IMPORT_MULTI_ADDRESSES//_GW/_ESP_CCSD} 2>/dev/null
+	fi
+		
+	local addr
+	for addr in ${IMPORT_ADDRESSES}; do
+		[[ "${addr%ADDR}" == "${addr}" ]] && continue
+		local val="${!addr%_*}"
+		[[ "${val}" == "dhcp" ]] && continue
+		[[ "${val}" == "umts" ]] && continue
+		IMPORT_MASKS="${IMPORT_MASKS} ${addr/ADDR/MASK}"
+	done
+
+	import_conf_noerr "${NET_FILE}" "${_IMPORT_FILTER_MASK}" $IMPORT_MASKS \
+			|| return 1
+}
+
+write_lock() {
+	local msg="${1}"
+	local profile
+	local ipsec="ipsec: \n"
+
+	(
+		flock -s 200
+		[[ -L "${CONFLINK}" ]] && profile="profile: $(basename -- "$(readlink -- "${CONFLINK}")")\n"
+		echo -e "${profile}${ipsec}${msg}" > "${NET_STATUS}"
+	) 200>>"${NET_STATUS}"
+}
+
+update_lock() {
+	local tag="$(escape_regexp_ext "${1}")"
+	local val="$(escape_regexp_ext "${2}")"
+
+	(
+		flock -s 200
+		sed -i -r "s,(${tag//,/\\,}: ).*,\1${val//,/\\,}," "${NET_STATUS}"
+	) 200>>"${NET_STATUS}"
+}
+
+append_lock() {
+	local msg="${1}"
+
+	(
+		flock -s 200
+		echo -e "${msg}" >> "${NET_STATUS}"
+	) 200>>"${NET_STATUS}"
+}
+
+errormsg_clean() {
+	touch -- "${NET_ERROR}"
+	chmod 0644 -- "${NET_ERROR}"
+	echo -n >"${NET_ERROR}"
+}
+
+errormsg_add() {
+	echo "$1" >>"${NET_ERROR}"
+}
+
+netchoice_set() {
+	basename -- "$(readlink -- "${CONFLINK}")" >"${NET_CHOICE}"
+}
+
+netlist_init() {
+	list-net-profiles.sh init
+}
+
+netlist_update() {
+	list-net-profiles.sh update
+	netchoice_set
+}
